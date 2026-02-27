@@ -33,7 +33,7 @@ chmod 755 /usr/bin/aalink
 ## Run
 
 ```bash
-sudo /usr/bin/aalink
+/usr/bin/aalink
 ```
 
 The daemon reads `/etc/aalink.conf` and writes status messages to `/tmp/MSPOSD.msg` (and optional extended data to `/tmp/aalink_ext.msg`).
