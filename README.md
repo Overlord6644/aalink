@@ -8,25 +8,32 @@ It monitors link quality (RSSI/PUBQ, optionally SNR), adjusts MCS/tx power, and 
 - `aalink30c.c` — main daemon source.
 - `aalink.conf` — example runtime configuration.
 
-## Build
+## Build (cross-compile for Star6E hard-float)
 
-Use GCC with pthread and math support:
+Use an ARM hard-float cross toolchain (for example `arm-linux-gnueabihf`) and build a static binary for the Star6E target:
 
 ```bash
-gcc -O2 -Wall -Wextra -o aalink aalink30c.c -lpthread -lm
+export CROSS_COMPILE=arm-linux-gnueabihf
+${CROSS_COMPILE}-gcc \
+  -O2 -Wall -Wextra \
+  -march=armv7-a -mfpu=neon -mfloat-abi=hard \
+  -o aalink aalink30c.c \
+  -lpthread -lm
 ```
+
+If your Star6E SDK provides a different triplet, replace `arm-linux-gnueabihf` with the SDK-provided prefix.
 
 ## Install
 
 ```bash
-sudo install -m 0755 aalink /usr/local/bin/aalink
-sudo install -m 0644 aalink.conf /etc/aalink.conf
+cp aalink /usr/bin/aalink
+chmod 755 /usr/bin/aalink
 ```
 
 ## Run
 
 ```bash
-sudo /usr/local/bin/aalink
+sudo /usr/bin/aalink
 ```
 
 The daemon reads `/etc/aalink.conf` and writes status messages to `/tmp/MSPOSD.msg` (and optional extended data to `/tmp/aalink_ext.msg`).
