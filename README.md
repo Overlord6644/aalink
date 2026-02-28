@@ -1,11 +1,11 @@
 # aalink
 
-`aalink` is a lightweight adaptive link controller for Wi-Fi video links.
+`aalink` is a lightweight adaptive link controller supporting Realtek AU, BU, CU, EU adapters and majestic streamer.
 It monitors link quality (RSSI/PUBQ, optionally SNR), adjusts MCS/tx power, and can update an encoder bitrate endpoint while publishing OSD status.
 
 ## Repository contents
 
-- `aalink30c.c` — main daemon source.
+- `aalink.c` — main daemon source.
 - `aalink.conf` — example runtime configuration.
 
 ## Build (cross-compile for Star6E hard-float)
@@ -17,7 +17,7 @@ export CROSS_COMPILE=arm-linux-gnueabihf
 ${CROSS_COMPILE}-gcc \
   -O2 -Wall -Wextra \
   -march=armv7-a -mfpu=neon -mfloat-abi=hard \
-  -o aalink aalink30c.c \
+  -o aalink aalink.c \
   -lpthread -lm
 ```
 
