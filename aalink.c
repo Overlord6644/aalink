@@ -1687,10 +1687,15 @@ static void apply_roiQp(int qp) {
 //  - > 11000 kbps : 0 (ROI off)
 //  - 11000 kbps   : 25% of SIMPLE_ROIQP
 //  - 2000 kbps    : 100% of SIMPLE_ROIQP
+/* Shared ROI degrade band: full quality at/above HI, ROI fully applied at/below
+   LO. Used by BOTH the roiQp ramp and the roiCenter shrink so they can't drift. */
+#define ROI_KBPS_HI 11000
+#define ROI_KBPS_LO 2000
+
 static inline int calc_roiQp_from_kbps(int kbps)
 {
-    const int hi = 11000;
-    const int lo = 2000;
+    const int hi = ROI_KBPS_HI;
+    const int lo = ROI_KBPS_LO;
     const int span = (hi - lo); // 9000
 
     if (kbps > hi) return 0;
@@ -1708,6 +1713,30 @@ static inline int calc_roiQp_from_kbps(int kbps)
 }
 
 
+/* Step 3 of the FPV degrade ladder: shrink the sharp ROI center as the
+   encoder starves. fpv.roiCenter is the width ratio of the full-quality
+   center (0.10..0.90, hot-settable). Big center when only mildly degraded,
+   small central window at the bottom - a smooth, glitch-free stand-in for a
+   resolution drop. Advances over the same kbps band as roiQp, so periphery
+   compression and center-shrink move together. Value carried x100 for the
+   int change-guard. */
+static void apply_roiCenter(int c100) {
+    static int p = -1;
+    if (c100 < 10) c100 = 10; else if (c100 > 90) c100 = 90;
+    if (c100 == p) return;
+    char path[96];
+    snprintf(path, sizeof(path), "/api/v1/set?fpv.roiCenter=0.%02d", c100);
+    run_local_api_cmd(path);
+    p = c100;
+}
+
+static inline int calc_roiCenter_from_kbps(int kbps) {
+    const int hi = ROI_KBPS_HI, lo = ROI_KBPS_LO;
+    if (kbps >= hi) return 90;         /* 0.90 = near-uniform, full quality  */
+    if (kbps <= lo) return 20;         /* 0.20 = small central sharp window   */
+    return 20 + (kbps - lo) * (90 - 20) / (hi - lo);
+}
+
 static void update_bitrate(int m, int width, float scale) {
     float total = (throughput_pct / 100.0f) * (scale > 0.0f ? scale : 1.0f);
     int kb = (width && pr[MCS_IDX(m)]) ? (int)(pr[MCS_IDX(m)] * (width / 20.0f) * total) : 0;
@@ -1717,11 +1746,30 @@ static void update_bitrate(int m, int width, float scale) {
     osd_kb = reduced_power_mode ? 100 : target;
     osd_colour_mod = (m < -2) ? 2 : ((m < 0) ? 5 : 3);
 
+    /* Idempotency guard: only touch the encoder when the target actually
+       changes, so the periodic resync (dispatched to THIS same mcs_worker from
+       the main loop) can fire every cycle without spamming venc. last_cmd_kb is
+       updated ONLY on a successful command, so a failed one (venc busy) retries
+       next cycle instead of sticking. update_bitrate runs on the mcs_worker or
+       rarely at startup/thermal - never concurrently on the hot path - so this
+       static needs no lock. */
+    static int last_cmd_kb = -1;
+    if (osd_kb == last_cmd_kb)
+        return;
+
 	int desired_qp = calc_roiQp_from_kbps(osd_kb);
     apply_roiQp(desired_qp);
+    /* Step 3: shrink the sharp center - ONLY when ROI is actually in use
+       (SIMPLE_ROIQP set) and ONLY for link starvation, never on thermal
+       throttle (which forces osd_kb=100 and would otherwise slam the center
+       to its floor for a heat event that has nothing to do with the link). */
+    if (simple_roiQp != 0 && !reduced_power_mode)
+        apply_roiCenter(calc_roiCenter_from_kbps(osd_kb));
 
     char cmd[256]; snprintf(cmd, sizeof(cmd), api_cmd, osd_kb);
-    int __attribute__((unused)) ret = run_local_api_cmd(cmd);
+    int ret = run_local_api_cmd(cmd);
+    if (ret == 0)
+        last_cmd_kb = osd_kb;   /* remember only a command that applied */
 
     VPRINT(2, "bitrate: mcs=%d width=%d scale=%.2f total=%.2f kb=%d", m, width, scale, total, osd_kb);
 }
@@ -2154,6 +2202,15 @@ int main(int argc, char *argv[]) {
 				
 				// Clamp
 				if (rssi_local < 0) rssi_local = 0;
+			} else if (fast > slow) {
+				// Recovery: the signal is rising. The slow EMA lags badly, so
+				// basing rssi_local on it kept the MCS/bitrate low long after the
+				// link recovered ("aalink doesn't bring the link back"). Track the
+				// fast EMA on the way up so recovery TRACKS the true signal rather
+				// than the lagging slow EMA. It is NOT as fast as the drop - step-up
+				// is still cooldown/confidence/hysteresis gated - just convergent;
+				// the predictive pessimism above still handles falls.
+				rssi_local = fast;
 			}
 		} else {
 			rssi_local = last;  // fallback if EMA not ready
@@ -2270,6 +2327,23 @@ int main(int argc, char *argv[]) {
 			if (nc && nc != channel) {
 				VPRINT(1, "Channel %d→%d", channel, nc);
 				channel = nc;
+			}
+			/* Periodic bitrate resync: re-affirm the target for the current
+			   (mcs,width) even on a stable link, so a config reload, a stuck
+			   value, or a previously-failed command self-corrects without
+			   waiting for an MCS change. DISPATCHED to the mcs_worker - the one
+			   thread that calls update_bitrate on the hot path - via the same
+			   mcs_lock maybe_adjust_mcs uses (no new lock). update_bitrate
+			   self-guards, so this is a no-op when nothing changed. */
+			if (used_rssi >= 0) {
+				pthread_mutex_lock(&mcs_lock);
+				if (!mcs_job_pending) {
+					mcs_job = (mcs_job_t){ .mcs = mcs, .width = width,
+					                       .scale = 1.0f, .cur_mcs = mcs };
+					mcs_job_pending = 1;
+					pthread_cond_signal(&mcs_cond);
+				}
+				pthread_mutex_unlock(&mcs_lock);
 			}
 		}
 
