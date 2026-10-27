@@ -835,6 +835,20 @@ static int majestic_get_video0_fps(int *out_fps) {
 static int majestic_get_video0_fps_from_yaml(int *out_fps) {
     if (!out_fps) return -1;
 
+    /* gslink's FPS_FULL first: waybeam's config file is not a safe source,
+       since a persisting API change snapshots the RUNNING config into it and
+       can write our heat-lowered rate there as the normal one. */
+    {
+        FILE *gf = fopen("/etc/gslink.conf", "r");
+        if (gf) {
+            char line[128];
+            int fps = 0;
+            while (!fps && fgets(line, sizeof(line), gf))
+                if (!strncmp(line, "FPS_FULL=", 9)) fps = atoi(line + 9);
+            fclose(gf);
+            if (fps > 0) { *out_fps = fps; return 0; }
+        }
+    }
     /* waybeam: its config file holds the configured rate (the live one may
        be ours, lowered for heat). The first "fps" key is video0's. The cli
        shim below would answer the LIVE value and restore the lowered one. */
