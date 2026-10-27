@@ -181,6 +181,11 @@ static float  pubq_f_short = 1.0f, pubq_f_long = 1.0f;
 
 // Quadratic dip tracking
 static float dip_score = 0.0f;
+/* Worst ground-reported video loss in the current adaptation window, as a
+   0..1 severity (5 % lost = 1). Taken once per window, not once per report:
+   the ground's report rate (pcpilot ~7/s, the VRX 2/s) must not set the gain. */
+static float loss_peak = 0.0f;
+#define LOSS_DIP_WEIGHT 25.0f   /* 5 % = 25 points of shift, 1 % = 1, 2 % = 4 */
 static uint64_t dip_last_window_ms = 0;
 static uint64_t pubq_last_change_ms = 0;
 static uint64_t pubq_emerg_last_step_ms = 0;
@@ -1815,6 +1820,8 @@ static void pubq_adapt_step(int q_raw, int nominal, bool reports_used,
         }
 
         if (now - dip_last_window_ms >= 2000) {
+            dip_score += LOSS_DIP_WEIGHT * loss_peak * loss_peak;
+            loss_peak = 0.0f;
             if (dip_score > 0.1f) {
                 dynamic_shift += thresh_adapt_gain * dip_score;
                 if (dynamic_shift > max_thresh_shift) dynamic_shift = max_thresh_shift;
@@ -2284,7 +2291,7 @@ int main(int argc, char *argv[]) {
 						if (enable_thresh_autoadapt && loss > 0) {
 							float sev = loss / 50.0f;      /* 5 % lost = full dip */
 							if (sev > 1.0f) sev = 1.0f;
-							dip_score += sev * sev;
+							if (sev > loss_peak) loss_peak = sev;
 						}
 					}
 				}
