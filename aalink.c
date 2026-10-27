@@ -1674,12 +1674,25 @@ static void set_power(int mcs) {
     }
 }
 
+/* A live encoder setting. waybeam's /api/v1/set rewrites /etc/waybeam.json on
+   every call - flash wear at link-step cadence, and a boot into the last
+   adaptive step - so use its RAM-only /api/v1/live/set; venc and majestic have
+   no such route (404), so fall back to /set there. */
+static void api_set_live(const char *query) {
+    char path[160], body[512];
+    snprintf(path, sizeof(path), "/api/v1/live/set?%s", query);
+    if (http_get_local(path, body, sizeof(body)) > 0 && strstr(body, "\"ok\":true"))
+        return;
+    snprintf(path, sizeof(path), "/api/v1/set?%s", query);
+    run_local_api_cmd(path);
+}
+
 static void apply_roiQp(int qp) {
     static int p = 999;
     if (qp == p) return;
-    char path[96];
-    snprintf(path, sizeof(path), "/api/v1/set?fpv.roiQp=%d", qp);
-    run_local_api_cmd(path);
+    char q[48];
+    snprintf(q, sizeof(q), "fpv.roiQp=%d", qp);
+    api_set_live(q);
     p = qp;
 }
 
@@ -1724,9 +1737,9 @@ static void apply_roiCenter(int c100) {
     static int p = -1;
     if (c100 < 10) c100 = 10; else if (c100 > 90) c100 = 90;
     if (c100 == p) return;
-    char path[96];
-    snprintf(path, sizeof(path), "/api/v1/set?fpv.roiCenter=0.%02d", c100);
-    run_local_api_cmd(path);
+    char q[48];
+    snprintf(q, sizeof(q), "fpv.roiCenter=0.%02d", c100);
+    api_set_live(q);
     p = c100;
 }
 
@@ -2255,6 +2268,25 @@ int main(int argc, char *argv[]) {
 					strncpy(gs_string, comma + 1, sizeof(gs_string) - 1);
 					gs_string[sizeof(gs_string) - 1] = '\0';
 					gs_string[strcspn(gs_string, "\r\n")] = '\0';
+				}
+				/* Optional third field from the ground: the video loss it
+				   actually sees, ",loss=<permille>". RSSI says how strong the
+				   link is, this says what it delivers - interference or
+				   multipath lose packets at a good RSSI. It feeds the same
+				   adaptive threshold shift as the camera's own TX queue dips,
+				   so the ladder backs off on loss and creeps back once clean.
+				   Stripped from gs_string so the OSD tag stays as it was. */
+				{
+					char *lp = strstr(gs_string, ",loss=");
+					if (lp) {
+						int loss = atoi(lp + 6);
+						*lp = '\0';
+						if (enable_thresh_autoadapt && loss > 0) {
+							float sev = loss / 50.0f;      /* 5 % lost = full dip */
+							if (sev > 1.0f) sev = 1.0f;
+							dip_score += sev * sev;
+						}
+					}
 				}
 
 				int val = atoi(buf);
