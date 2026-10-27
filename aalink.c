@@ -756,6 +756,18 @@ static int extract_http_local_path(const char *s, char *out, size_t out_cap) {
     out[0] = 0;
 
     if (s[0] == '/') {
+        /* An absolute program path is a command, not a URL path:
+           API_CMD=/usr/bin/gslink %d used to go out as "GET /usr/bin/gslink
+           19800", the encoder ignored it, the unread reply counted as success,
+           and the bitrate never left the config file's value. */
+        char prog[256];
+        size_t n = strcspn(s, " \t");
+        if (n < sizeof(prog)) {
+            memcpy(prog, s, n);
+            prog[n] = 0;
+            if (access(prog, X_OK) == 0)
+                return -1;
+        }
         strncpy(out, s, out_cap - 1);
         out[out_cap - 1] = 0;
         return 0;
