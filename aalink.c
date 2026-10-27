@@ -161,6 +161,9 @@ static int osd_q = -1;
 static int osd_colour_mod = 3;
 static int avg_ant = 1;
 static int high_temp = 95;
+/* Bitrate held while the SoC is too hot. 100 kbps (upstream) is a picture
+   nobody can fly on; THERMAL_KBPS lets it be a usable floor instead. */
+static int thermal_kbps = 100;
 static int simple_roiQp = 0;
 static int use_snr_mode = 0;
 static float snr_multi = 1.5f;
@@ -832,6 +835,23 @@ static int majestic_get_video0_fps(int *out_fps) {
 static int majestic_get_video0_fps_from_yaml(int *out_fps) {
     if (!out_fps) return -1;
 
+    /* waybeam: its config file holds the configured rate (the live one may
+       be ours, lowered for heat). The first "fps" key is video0's. The cli
+       shim below would answer the LIVE value and restore the lowered one. */
+    {
+        FILE *wf = fopen("/etc/waybeam.json", "r");
+        if (wf) {
+            char line[160];
+            int fps = 0;
+            while (!fps && fgets(line, sizeof(line), wf)) {
+                char *q = strstr(line, "\"fps\"");
+                if (q && (q = strchr(q, ':'))) fps = atoi(q + 1);
+            }
+            fclose(wf);
+            if (fps > 0) { *out_fps = fps; return 0; }
+        }
+    }
+
     const char *cmds[] = {
         "cli -g .video0.fps 2>/dev/null",
         "yaml-cli -i /etc/majestic.yaml -g .video0.fps 2>/dev/null",
@@ -875,10 +895,22 @@ static int mi_sensor_set_fps(int fps) {
 }
 
 // Re-apply current configured FPS from /etc/majestic.yaml (same path used by thermal restore).
+/* Thermal frame rate. waybeam keeps the sensor at its mode's max and
+   decimates in the VPE->VENC bind; a setfps written to the sensor driver
+   behind its back can stall that pipeline. Ask the encoder first (live,
+   not persisted); the driver path stays for majestic/venc builds. */
+static int thermal_set_fps(int fps) {
+    char path[64], body[256];
+    snprintf(path, sizeof(path), "/api/v1/live/set?video0.fps=%d", fps);
+    if (http_get_local(path, body, sizeof(body)) > 0 && strstr(body, "\"ok\":true"))
+        return 0;
+    return mi_sensor_set_fps(fps);
+}
+
 static int reapply_fps_from_majestic_yaml(const char *reason) {
     int file_fps = 0;
     if (majestic_get_video0_fps_from_yaml(&file_fps) != 0 || file_fps <= 0) return -1;
-    if (mi_sensor_set_fps(file_fps) != 0) return -1;
+    if (thermal_set_fps(file_fps) != 0) return -1;
     if (reason && *reason) VPRINT(1, "Re-applied FPS from majestic.yaml -> %d (%s)", file_fps, reason);
     else VPRINT(1, "Re-applied FPS from majestic.yaml -> %d", file_fps);
     return file_fps;
@@ -1110,6 +1142,7 @@ static void load_config(void) {
 		else if (!strcmp(key, "EXTERNAL_OSD")) external_osd = atoi(val);
 		else if (!strcmp(key, "OSD_SCALE")) osd_scale = atof(val);
 		else if (!strcmp(key, "HIGH_TEMP")) high_temp = atoi(val);
+		else if (!strcmp(key, "THERMAL_KBPS")) thermal_kbps = atoi(val);
 		else if (!strcmp(key, "REDUCED_POWER_MODE")) reduced_power_mode = atoi(val);
 		else if (!strcmp(key, "MCS_SOURCE")) strncpy(mcs_source, val, sizeof(mcs_source) - 1);
 		else if (!strcmp(key, "SHOW_SIGNAL_BARS")) show_signal_bars = !strcasecmp(val, "true");
@@ -1773,7 +1806,7 @@ static void update_bitrate(int m, int width, float scale) {
     int target = kb > 0 ? kb : 1500;
     if (target < 100) target = 100; else if (target > 52000) target = 52000;
 
-    osd_kb = reduced_power_mode ? 100 : target;
+    osd_kb = reduced_power_mode ? (thermal_kbps < target ? thermal_kbps : target) : target;
     osd_colour_mod = (m < -2) ? 2 : ((m < 0) ? 5 : 3);
 
     /* Idempotency guard: only touch the encoder when the target actually
@@ -2469,7 +2502,7 @@ int main(int argc, char *argv[]) {
 
 		int desired = 30;
 		if (desired != thermal_fps_applied) {
-			if (mi_sensor_set_fps(desired) == 0) {
+			if (thermal_set_fps(desired) == 0) {
 				thermal_fps_applied = desired;
 				VPRINT(1, "Thermal FPS → %d (enter REDUCING_HEAT)", thermal_fps_applied);
 			}
@@ -2484,7 +2517,7 @@ int main(int argc, char *argv[]) {
 		if (restore <= 0) restore = 60;
 
 		if (restore != thermal_fps_applied) {
-			if (mi_sensor_set_fps(restore) == 0) {
+			if (thermal_set_fps(restore) == 0) {
 				thermal_fps_applied = restore;
 				VPRINT(1, "Thermal FPS → %d (restore)", thermal_fps_applied);
 			}
@@ -2499,7 +2532,7 @@ int main(int argc, char *argv[]) {
 	else if (delta >= 5) desired = 20;
 
 	if (desired != thermal_fps_applied) {
-		if (mi_sensor_set_fps(desired) == 0) {
+		if (thermal_set_fps(desired) == 0) {
 			thermal_fps_applied = desired;
 			VPRINT(1, "Thermal FPS → %d (temp=%d, thres=%d)", thermal_fps_applied, max, high_temp);
 		}
