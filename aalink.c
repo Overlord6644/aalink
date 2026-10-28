@@ -909,16 +909,19 @@ static int mi_sensor_set_fps(int fps) {
 }
 
 // Re-apply current configured FPS from /etc/majestic.yaml (same path used by thermal restore).
-/* Thermal frame rate. waybeam keeps the sensor at its mode's max and
-   decimates in the VPE->VENC bind; a setfps written to the sensor driver
-   behind its back can stall that pipeline. Ask the encoder first (live,
-   not persisted); the driver path stays for majestic/venc builds. */
+/* Thermal frame rate. The SENSOR rate is what cools: sensor readout, ISP
+   and encoder all slow down with it, which is how the stock step-down held
+   the SoC at 95-100 C. waybeam's own video0.fps only decimates in the
+   VPE->VENC bind - sensor and ISP keep running flat out - and on its own it
+   let the camera climb past 115 C. So the sensor driver first, then the
+   encoder's live rate (not persisted) to match it. */
 static int thermal_set_fps(int fps) {
     char path[64], body[256];
+    int sensor = mi_sensor_set_fps(fps);
     snprintf(path, sizeof(path), "/api/v1/live/set?video0.fps=%d", fps);
     if (http_get_local(path, body, sizeof(body)) > 0 && strstr(body, "\"ok\":true"))
         return 0;
-    return mi_sensor_set_fps(fps);
+    return sensor;
 }
 
 static int reapply_fps_from_majestic_yaml(const char *reason) {
